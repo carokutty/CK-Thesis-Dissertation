@@ -1,0 +1,169 @@
+---
+title: "R Notebook"
+output: html_notebook:
+  theme: united
+---
+
+
+
+```{r}
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+
+data_path <- "GSE127465.RAW"
+human_files <- list.files(path = data_path, pattern = "_human_.*_raw_counts.tsv.gz$", full.names = TRUE)
+
+# Initialize combined matrix
+combined_mat <- NULL
+
+# Load and merge all human count matrices
+for (file in human_files) {
+  message("Reading: ", file)
+  dt <- fread(file)
+  
+  if (ncol(dt) < 2) {
+    message("Skipping empty or malformed file: ", file)
+    next
+  }
+  
+  mat <- as.matrix(dt[, -1, with = FALSE])
+  rownames(mat) <- dt[[1]]
+  sample_id <- gsub("_raw_counts.tsv.gz", "", basename(file))
+  colnames(mat) <- paste0(sample_id, "_", colnames(mat))
+  
+  mat_t <- Matrix(t(mat), sparse = TRUE)
+  
+  if (is.null(combined_mat)) {
+    combined_mat <- mat_t
+  } else {
+    combined_mat <- cbind(combined_mat, mat_t)
+  }
+}
+
+# Check matrix validity
+if (is.null(combined_mat) || nrow(combined_mat) == 0 || ncol(combined_mat) == 0) {
+  stop("Combined matrix is empty. No valid data was loaded.")
+}
+```
+
+```{r}
+# Filter low-quality cells (library size < threshold)
+threshold <- 10
+lib_sizes <- Matrix::colSums(combined_mat)
+combined_mat <- combined_mat[, lib_sizes >= threshold]
+
+# Filter out genes with zero counts
+gene_sums <- Matrix::rowSums(combined_mat)
+combined_mat <- combined_mat[gene_sums > 0, ]
+
+# Create SingleCellExperiment object
+sce <- SingleCellExperiment(assays = list(counts = combined_mat))
+
+sf <- sizeFactors(sce)
+lib_sizes <- Matrix::colSums(counts(sce))
+
+# Check lengths
+length(sf) 
+length(lib_sizes)
+```
+
+```{r}
+#Plot
+plot(sf, lib_sizes,
+     log = "xy",
+     xlab = "Size factors", ylab = "Library sizes")
+abline(a = 0, b = 1, col = "red")
+```
+
+```{r}
+# Basic checks
+dim(combined_mat)
+head(rownames(combined_mat))   
+head(colnames(combined_mat))    
+```
+
+```{r}
+# Make sure all cells have non-zero library sizes
+sum(Matrix::colSums(combined_mat) == 0)  
+
+# Make sure genes have non-zero expression
+sum(Matrix::rowSums(combined_mat) == 0)   
+rownames(combined_mat) <- sub("^GSM\\d+_human_[^_]+_", "", rownames(combined_mat))
+head(rownames(combined_mat))  
+```
+
+```{r}
+# Assign batch info 
+batch_labels <- sapply(colnames(combined_mat), function(x) strsplit(x, "_")[[1]][1])
+colData(sce)$batch <- batch_labels
+
+
+# Normalize and compute size factors
+sce <- sce[, Matrix::colSums(counts(sce)) > 100]  # Keep cells with >100 counts
+
+set.seed(123)
+clusters <- quickCluster(sce)
+table(clusters)
+```
+
+```{r}
+# Compute size factors with clusters
+sce <- computeSumFactors(sce, clusters = clusters)
+
+# Check for any size factors ≤ 0
+summary(sizeFactors(sce))
+
+# Run decontX
+sce <- decontX(sce)
+
+head(colData(sce)$decontX_contamination)
+summary(colData(sce)$decontX_contamination)
+hist(colData(sce)$decontX_contamination, breaks = 50, main = "Estimated contamination", xlab = "Contamination fraction")
+```
+
+```{r}
+high_contam_cells <- which(colData(sce)$decontX_contamination > 0.5)
+length(high_contam_cells)  # Number of highly contaminated cells
+hist(colData(sce)$decontX_contamination, breaks = 100,
+     main = "Contamination Fraction Distribution",
+     xlab = "Contamination Level")
+abline(v = 0.3, col = "red", lwd = 2)  
+
+```
+
+```{r}
+library(scater)
+# Before decontX
+sce_raw <- logNormCounts(sce, assay.type = "counts")
+sce_raw <- runPCA(sce_raw)
+sce_raw <- runUMAP(sce_raw, dimred = "PCA")
+
+# After decontX
+logcounts(sce) <- log1p(assay(sce, "decontXcounts"))
+sce <- runPCA(sce)
+sce <- runUMAP(sce, dimred = "PCA")
+```
+
+```{r}
+
+high_contam_cells <- which(colData(sce)$decontX_contamination > 0.5)
+length(high_contam_cells)  # Number of highly contaminated cells
+hist(colData(sce)$decontX_contamination, breaks = 100,
+     main = "Contamination Fraction Distribution",
+     xlab = "Contamination Level")
+abline(v = 0.3, col = "red", lwd = 2)  # Assuming 0.3 is your threshold
+summary(colData(sce)$decontX_contamination > 0.3)
+sce_clean <- sce[, colData(sce)$decontX_contamination <= 0.3]
+dim(sce_clean)
+
+writeMM(assays(sce_clean)$decontXcounts, file = "cleaned_decontx_counts.mtx")
+write.table(rownames(sce_clean), "cleaned_features.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(colnames(sce_clean), "cleaned_barcodes.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+
+
+```
+
+
+
