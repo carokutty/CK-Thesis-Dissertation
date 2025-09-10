@@ -1,0 +1,372 @@
+---
+title: "CELL CHAT FOR L-R Pairs"
+output: html_notebook:
+  theme: united
+---
+
+
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(dplyr)
+library(liana)
+
+# Load counts 
+counts <- Matrix::readMM("soupx_raw_counts/soupx_raw_counts.mtx")
+features <- read.delim("soupx_raw_counts/features.tsv", header = FALSE)
+barcodes <- read.delim("soupx_raw_counts/barcodes.tsv", header = FALSE)
+
+rownames(counts) <- make.unique(as.character(barcodes$V1))   # cells
+colnames(counts) <- make.unique(as.character(features$V1))   # genes
+cat("Counts dims:", dim(counts), "\n")
+
+# Load metadata
+meta <- read.delim("../GSE127465_human_cell_metadata_54773x25.tsv.gz", 
+                   header = TRUE, stringsAsFactors = FALSE)
+meta$cell_id <- paste(meta$Patient, meta$Library, meta$Barcode, sep = "_")
+rownames(meta) <- meta$cell_id
+meta$Major.cell.type <- as.character(meta$Major.cell.type)
+```
+
+```{r}
+#Map tumor subtypes
+tumor_map <- c(
+  "Patient1-specific" = "Tumor_Basal-like_squamous",
+  "Patient2-specific" = "Tumor_Secretory/Stress-Adapted Epithelium",
+  "Patient3-specific" = "Tumor_Mucinous Goblet like program",
+  "Patient4-specific" = "Tumor_AT2-like/epithelial enriched",
+  "Patient5-specific" = "Tumor_AT2-like/surfactant reproducing",
+  "Patient6-specific" = "Tumor_Hypoxic secretory / Stress-adapted",
+  "Patient7-specific" = "Tumor_Secretory/Inflammatory Hybrid"
+)
+meta$TumorSubtype <- ifelse(meta$Major.cell.type %in% names(tumor_map),
+                            tumor_map[meta$Major.cell.type], NA)
+
+immune_levels <- c("tT cells","tB cells","tNK cells","tPlasma cells",
+                   "tpDC","tMast cells","tMoMacDC","tNeutrophils")
+meta$TumorImmune <- ifelse(meta$Major.cell.type %in% names(tumor_map), "Tumor",
+                           ifelse(meta$Major.cell.type %in% immune_levels, "Immune", "Other"))
+
+```
+
+```{r}
+meta$MajorPlusTumorSubtype <- meta$Major.cell.type
+meta$MajorPlusTumorSubtype[meta$MajorPlusTumorSubtype %in% names(tumor_map)] <-
+  tumor_map[meta$MajorPlusTumorSubtype[meta$MajorPlusTumorSubtype %in% names(tumor_map)]]
+
+#Subset counts and metadata to Tumor + Immune 
+barcode_to_cellid <- setNames(meta$cell_id, meta$Barcode)
+common_barcodes <- intersect(rownames(counts), meta$Barcode[meta$TumorImmune %in% c("Tumor","Immune")])
+
+counts_sub <- counts[common_barcodes, , drop = FALSE]
+rownames(counts_sub) <- barcode_to_cellid[common_barcodes]
+
+meta_sub <- meta[meta$cell_id %in% rownames(counts_sub), , drop = FALSE]
+meta_sub <- meta_sub[match(rownames(counts_sub), meta_sub$cell_id), ]
+stopifnot(all(rownames(counts_sub) == meta_sub$cell_id))
+
+# Transpose for Seurat (genes x cells) and convert to sparse
+counts_sub <- t(counts_sub)
+counts_sub <- as(counts_sub, "dgCMatrix")
+
+# Filter zero-count genes
+counts_sub <- counts_sub[rowSums(counts_sub) > 0, ]
+```
+
+```{r}
+#To create Seurat object
+seurat_obj <- CreateSeuratObject(counts = counts_sub, meta.data = meta_sub)
+Idents(seurat_obj) <- seurat_obj@meta.data$MajorPlusTumorSubtype
+
+# Subset to specific tumor + immune subtypes 
+cells_to_keep <- WhichCells(seurat_obj, idents = c(
+  "Tumor_Basal-like_squamous", "Tumor_Secretory/Stress-Adapted Epithelium",
+  "Tumor_Mucinous Goblet like program", "Tumor_AT2-like/epithelial enriched",
+  "Tumor_AT2-like/surfactant reproducing", "Tumor_Hypoxic secretory / Stress-adapted",
+  "Tumor_Secretory/Inflammatory Hybrid",
+  "tT cells","tB cells","tNK cells","tPlasma cells",
+  "tpDC","tMast cells","tMoMacDC","tNeutrophils"
+))
+
+```
+
+```{r}
+seurat_ti <- subset(seurat_obj, cells = cells_to_keep)
+DefaultAssay(seurat_ti) <- "RNA"
+
+# Normalizing the data (fills the data slot)
+seurat_ti <- NormalizeData(seurat_ti)
+
+#Verify the data slot is non-empty
+dim(GetAssayData(seurat_ti, slot = "data"))
+```
+
+```{r}
+#Run LIANA
+liana_res <- liana_wrap(seurat_ti, idents_col = "MajorPlusTumorSubtype")
+
+head(liana_res)
+str(liana_res)
+
+library(dplyr)
+
+liana_natmi <- liana_res$natmi
+
+# Got top 10 ligand–receptor pairs per source-target
+top_natmi <- liana_natmi %>%
+  group_by(source, target) %>%
+  slice_max(order_by = prod_weight, n = 10)
+
+```
+
+```{r}
+# Define tumor and immune cluster names
+tumor_clusters <- c(
+  "Tumor_Basal-like_squamous", "Tumor_Secretory/Stress-Adapted Epithelium",
+  "Tumor_Mucinous Goblet like program", "Tumor_AT2-like/epithelial enriched",
+  "Tumor_AT2-like/surfactant reproducing", "Tumor_Hypoxic secretory / Stress-adapted",
+  "Tumor_Secretory/Inflammatory Hybrid"
+)
+
+immune_clusters <- c(
+  "tT cells","tB cells","tNK cells","tPlasma cells",
+  "tpDC","tMast cells","tMoMacDC","tNeutrophils"
+)
+
+# Filter only tumor to immune interactions
+tumor_to_immune <- top_natmi %>%
+  filter(source %in% tumor_clusters & target %in% immune_clusters)
+
+immune_to_tumor <- top_natmi %>%
+  filter(source %in% immune_clusters & target %in% tumor_clusters)
+
+# Combined
+tumor_immune_interactions <- bind_rows(tumor_to_immune, immune_to_tumor)
+
+#To check counts
+table(tumor_immune_interactions$source, tumor_immune_interactions$target)
+
+
+```
+
+```{r}
+# Define focused immune cell types 
+immune_cells <- c("tNK cells", "tpDC", "tMoMacDC", "tNeutrophils")
+
+# Filter interactions: Tumor as source, immune cells as target, and high prod_weight (>75th percentile)
+tumor_to_immune_p1 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_Basal-like_squamous",          
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# View the filtered interactions
+print(tumor_to_immune_p1)
+
+tumor_to_immune_top_pairs_p1 <- tumor_to_immune_p1 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# join back to keep interaction details of those pairs
+p1_top5 <- tumor_to_immune_p1 %>%
+  semi_join(tumor_to_immune_top_pairs_p1, by = c("source", "target"))
+
+
+```
+
+```{r}
+tumor_to_immune_p2 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_Secretory/Stress-Adapted Epithelium",          
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# Viewed the filtered interactions
+print(tumor_to_immune_p2)
+
+tumor_to_immune_top_pairs_p2 <- tumor_to_immune_p2 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# join back to keep interaction details of those pairs
+p2_top5 <- tumor_to_immune_p2 %>%
+  semi_join(tumor_to_immune_top_pairs_p2, by = c("source", "target"))
+
+```
+
+```{r}
+tumor_to_immune_p3 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_Mucinous Goblet like program",          
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# View the filtered interactions
+print(tumor_to_immune_p3)
+
+tumor_to_immune_top_pairs_p3 <- tumor_to_immune_p3 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# joined back to keep interaction details of those pairs
+p3_top5 <- tumor_to_immune_p3 %>%
+  semi_join(tumor_to_immune_top_pairs_p3, by = c("source", "target"))
+
+```
+
+```{r}
+tumor_to_immune_p4 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_AT2-like/epithelial enriched",        
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# View the filtered interactions
+print(tumor_to_immune_p4)
+
+tumor_to_immune_top_pairs_p4 <- tumor_to_immune_p4 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# joined back to keep interaction details of those pairs
+p4_club_top5 <- tumor_to_immune_p4 %>%
+  semi_join(tumor_to_immune_top_pairs_p4, by = c("source", "target"))
+
+```
+
+```{r}
+tumor_to_immune_p5 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_AT2-like/surfactant reproducing",        
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# View the filtered interactions
+print(tumor_to_immune_p5)
+
+tumor_to_immune_top_pairs_p5 <- tumor_to_immune_p5 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# joined back to keep interaction details of those pairs
+p5_top5 <- tumor_to_immune_p5 %>%
+  semi_join(tumor_to_immune_top_pairs_p5, by = c("source", "target"))
+
+```
+
+```{r}
+tumor_to_immune_p6 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_Hypoxic secretory / Stress-adapted",        
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# Viewed the filtered interactions
+print(tumor_to_immune_p6)
+
+tumor_to_immune_top_pairs_p6 <- tumor_to_immune_p6 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# join back to keep interaction details of those pairs
+p6_top5 <- tumor_to_immune_p6 %>%
+  semi_join(tumor_to_immune_top_pairs_p6, by = c("source", "target"))
+
+```
+
+```{r}
+tumor_to_immune_p7 <- tumor_immune_interactions %>%
+  filter(
+    source == "Tumor_Secretory/Inflammatory Hybrid",        
+    target %in% immune_cells,
+    prod_weight > quantile(prod_weight, 0.75)
+  )
+
+# Viewed the filtered interactions
+print(tumor_to_immune_p7)
+
+tumor_to_immune_top_pairs_p7 <- tumor_to_immune_p7 %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop") %>%
+  arrange(desc(max_weight)) %>%
+  slice_head(n = 5)
+
+# joined back to keep interaction details of those pairs
+p7_top5 <- tumor_to_immune_p7 %>%
+  semi_join(tumor_to_immune_top_pairs_p7, by = c("source", "target"))
+
+
+```
+
+```{r}
+library(igraph)
+library(ggraph)
+
+# Combine all top interactions (p1_top5, p2_top5, ..., p7_top5)
+all_top_interactions <- bind_rows(p1_top5, p2_top5, p3_top5, p4_club_top5, p5_top5, p6_top5, p7_top5)
+
+# Create graph
+edges <- all_top_interactions %>%
+  select(source, target, prod_weight) %>%
+  rename(from = source, to = target, weight = prod_weight)
+
+g <- graph_from_data_frame(edges, directed = TRUE)
+
+# Plot
+ggraph(g, layout = "fr") +
+  geom_edge_link(aes(width = weight, color = weight), alpha = 0.7) +
+  geom_node_point(size = 6, color = "skyblue") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_void() +
+  scale_edge_color_gradient(low = "gray80", high = "red")
+
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Aggregated max prod_weight per tumor-immune pair
+heatmap_data <- all_top_interactions %>%
+  group_by(source, target) %>%
+  summarise(max_weight = max(prod_weight), .groups = "drop")
+
+ggplot(heatmap_data, aes(x = target, y = source, fill = max_weight)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Immune Cells", y = "Tumor Programs", fill = "Prod Weight")
+
+```
+
+```{r}
+library(circlize)
+
+# Prepare data
+chord_data <- all_top_interactions %>%
+  select(source, target, prod_weight)
+
+chordDiagram(chord_data, transparency = 0.5, directional = 1)
+
+```
